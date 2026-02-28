@@ -1,0 +1,36 @@
+# Dockerfile.web — Indus public website (Railway)
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY apps/web/package.json ./apps/web/
+COPY package.json ./
+
+WORKDIR /app/apps/web
+RUN npm install
+
+COPY apps/web/ ./
+
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+
+# ── Runtime ───────────────────────────────────────────────────
+FROM node:20-alpine AS runtime
+
+RUN apk add --no-cache dumb-init
+
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_ENV=production
+
+COPY --from=builder /app/apps/web/.next/standalone ./
+COPY --from=builder /app/apps/web/.next/static ./.next/static
+COPY --from=builder /app/apps/web/public ./public
+
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s \
+  CMD wget -q -O- http://localhost:3000/api/health || exit 1
+
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["node", "server.js"]

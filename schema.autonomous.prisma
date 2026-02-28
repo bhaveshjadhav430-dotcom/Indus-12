@@ -1,0 +1,65 @@
+// prisma/schema.autonomous.prisma
+// Append these models to your existing schema.prisma
+// (Raw SQL migration_autonomous.sql handles the actual DDL)
+//
+// These models are for type-safe raw query reference only.
+// The tables are created by migration_autonomous.sql.
+
+// ─── Autonomous Platform Models ──────────────────────────────
+
+// model IdempotencyKey {
+//   id           String   @id
+//   responseBody Json?    @map("response_body")
+//   statusCode   Int?     @map("status_code")
+//   createdAt    DateTime @default(now()) @map("created_at")
+//   expiresAt    DateTime @map("expires_at")
+//   locked       Boolean  @default(false)
+//   lockedAt     DateTime? @map("locked_at")
+//   @@map("idempotency_keys")
+//   @@index([expiresAt])
+// }
+
+// model Incident {
+//   id               String    @id @default(uuid())
+//   priority         String    // P1|P2|P3|P4
+//   status           String    // OPEN|AUTO_HEALING|ESCALATED|RESOLVED|CLOSED
+//   title            String
+//   invariant        String?
+//   details          Json
+//   forensicSnapshot Json?     @map("forensic_snapshot")
+//   autoHealAttempts Int       @default(0) @map("auto_heal_attempts")
+//   autoHealed       Boolean   @default(false) @map("auto_healed")
+//   resolvedBy       String?   @map("resolved_by")
+//   resolvedReason   String?   @map("resolved_reason")
+//   createdAt        DateTime  @default(now()) @map("created_at")
+//   updatedAt        DateTime  @updatedAt @map("updated_at")
+//   resolvedAt       DateTime? @map("resolved_at")
+//   escalatedAt      DateTime? @map("escalated_at")
+//   @@map("incidents")
+// }
+
+// model InvariantViolation {
+//   id            String   @id @default(uuid())
+//   invariant     String
+//   shopId        String?  @map("shop_id")
+//   entityId      String   @map("entity_id")
+//   entityType    String   @map("entity_type")
+//   driftScore    Decimal  @default(0) @map("drift_score")
+//   details       Json
+//   autoCorrected Boolean  @default(false) @map("auto_corrected")
+//   correction    Json?
+//   incidentId    String?  @map("incident_id")
+//   createdAt     DateTime @default(now()) @map("created_at")
+//   @@map("invariant_violations")
+// }
+
+// model SystemMode {
+//   id             Int      @id @default(1)
+//   safeMode       Boolean  @default(false) @map("safe_mode")
+//   safeModeReason String?  @map("safe_mode_reason")
+//   enabledAt      DateTime? @map("enabled_at")
+//   enabledBy      String?  @map("enabled_by")
+//   overrideToken  String?  @map("override_token")
+//   updatedAt      DateTime @updatedAt @map("updated_at")
+//   @@map("system_mode")
+// }

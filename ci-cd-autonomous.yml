@@ -1,0 +1,266 @@
+# .github/workflows/autonomous-deploy.yml
+name: Autonomous Deployment Pipeline
+
+on:
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+    inputs:
+      skip_coverage:
+        description: Skip coverage gate (requires approval)
+        type: boolean
+        default: false
+
+env:
+  NODE_VERSION: '20'
+  REGISTRY: ghcr.io
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # STAGE 1 — Quality Gates
+  # ─────────────────────────────────────────────────────────
+  quality-gates:
+    name: Quality Gates
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB:       testdb
+          POSTGRES_USER:     test
+          POSTGRES_PASSWORD: test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+
+    outputs:
+      drift_score:  ${{ steps.integrity.outputs.drift_score }}
+      health_score: ${{ steps.integrity.outputs.health_score }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/testdb
+        run: |
+          npx prisma migrate deploy
+          psql $DATABASE_URL -f prisma/migration_autonomous.sql
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit & Integration tests
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/testdb
+          REDIS_URL:    redis://localhost:6379
+          NODE_ENV:     test
+        run: |
+          npx jest --coverage --coverageReporters=json-summary --coverageReporters=text \
+            --forceExit --testTimeout=30000
+
+      - name: Enforce coverage threshold
+        run: |
+          PCT=$(node -e "const r=require('./coverage/coverage-summary.json'); console.log(r.total.lines.pct)")
+          echo "Line coverage: ${PCT}%"
+          if (( $(echo "$PCT < 85" | bc -l) )); then
+            echo "❌ Coverage ${PCT}% below 85% threshold"
+            exit 1
+          fi
+          echo "✅ Coverage ${PCT}% passes"
+
+      - name: Integrity pre-check
+        id: integrity
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/testdb
+        run: |
+          DRIFT=$(psql $DATABASE_URL -t -c "SELECT COALESCE(score,100) FROM drift_scores ORDER BY created_at DESC LIMIT 1" | tr -d ' ')
+          echo "drift_score=${DRIFT:-100}" >> $GITHUB_OUTPUT
+          echo "health_score=100" >> $GITHUB_OUTPUT
+          echo "Drift score: ${DRIFT:-100}"
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 2 — Build & Security Scan
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build & Scan
+    needs: quality-gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg BUILD_SHA=${{ github.sha }} \
+            --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            -t ${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }} \
+            .
+
+      - name: Docker security scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+
+      - name: Push image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          docker push ${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }}
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 3 — Staging Deploy + Autonomous Gate
+  # ─────────────────────────────────────────────────────────
+  staging-deploy:
+    name: Staging Deploy
+    needs: [quality-gates, build]
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run deployment gates against staging
+        env:
+          DATABASE_URL: ${{ secrets.STAGING_DATABASE_URL }}
+          NODE_ENV:     staging
+        run: |
+          npm ci
+          node -e "
+            const { runDeploymentGates } = require('./dist/autonomous/deployment-gates');
+            const { PrismaClient } = require('@prisma/client');
+            const p = new PrismaClient();
+            runDeploymentGates(p, 'ci-staging', true)
+              .then(() => { console.log('Gates passed'); process.exit(0); })
+              .catch(err => { console.error('Gates failed:', err.message); process.exit(1); })
+              .finally(() => p.\$disconnect());
+          "
+
+      - name: Deploy to staging
+        env:
+          KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
+          kubectl --kubeconfig /tmp/kubeconfig set image deployment/indus-api \
+            app=${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }} \
+            -n staging
+          kubectl --kubeconfig /tmp/kubeconfig rollout status deployment/indus-api \
+            -n staging --timeout=5m
+
+      - name: Post-deploy smoke test
+        env:
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+        run: |
+          sleep 15
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "$STAGING_URL/health")
+          [ "$STATUS" = "200" ] || { echo "Health check failed: $STATUS"; exit 1; }
+          HEALTH=$(curl -sf "$STAGING_URL/system-health" | jq '.score')
+          echo "Health score: $HEALTH"
+          if (( $(echo "$HEALTH < 60" | bc -l) )); then
+            echo "❌ Staging health score ${HEALTH} below 60"
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────────────────
+  # STAGE 4 — Production Deploy (gated)
+  # ─────────────────────────────────────────────────────────
+  production-deploy:
+    name: Production Deploy
+    needs: staging-deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://api.indus.example.com
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run production deployment gates
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+          NODE_ENV:     production
+        run: |
+          npm ci
+          node -e "
+            const { runDeploymentGates } = require('./dist/autonomous/deployment-gates');
+            const { PrismaClient } = require('@prisma/client');
+            const p = new PrismaClient();
+            runDeploymentGates(p, 'ci-production', ${{ inputs.skip_coverage || 'false' }})
+              .then(() => process.exit(0))
+              .catch(err => { console.error(err.message); process.exit(1); })
+              .finally(() => p.\$disconnect());
+          "
+
+      - name: Apply DB migrations (safe)
+        env:
+          DATABASE_URL: ${{ secrets.PROD_DATABASE_URL }}
+        run: |
+          npx prisma migrate deploy
+          psql $DATABASE_URL -f prisma/migration_autonomous.sql || true
+
+      - name: Blue/Green deploy
+        env:
+          KUBE_CONFIG: ${{ secrets.PROD_KUBE_CONFIG }}
+        run: |
+          echo "$KUBE_CONFIG" | base64 -d > /tmp/kubeconfig
+          kubectl --kubeconfig /tmp/kubeconfig set image deployment/indus-api \
+            app=${{ env.REGISTRY }}/${{ github.repository }}:${{ github.sha }} \
+            -n production
+          kubectl --kubeconfig /tmp/kubeconfig rollout status deployment/indus-api \
+            -n production --timeout=10m
+
+      - name: Post-deploy health verification
+        env:
+          PROD_URL: ${{ secrets.PROD_URL }}
+        run: |
+          sleep 30
+          for i in 1 2 3; do
+            HEALTH=$(curl -sf "$PROD_URL/system-health" | jq '.score // 0')
+            echo "Attempt $i — Health score: $HEALTH"
+            if (( $(echo "$HEALTH >= 70" | bc -l) )); then
+              echo "✅ Production health score $HEALTH — deploy successful"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "❌ Production health score below threshold after 3 checks — manual review required"
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          curl -X POST $SLACK_WEBHOOK -H 'Content-Type: application/json' \
+            -d "{\"text\":\"🚨 *PRODUCTION DEPLOY FAILED* for commit \`${{ github.sha }}\`. Check GitHub Actions.\"}"

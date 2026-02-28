@@ -1,0 +1,217 @@
+// packages/db/prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  SHOP_MANAGER
+}
+
+enum SaleStatus {
+  DRAFT
+  CONFIRMED
+  VOIDED
+}
+
+enum PaymentMode {
+  CASH
+  UPI
+  BANK_TRANSFER
+  CREDIT
+}
+
+enum StockMovementType {
+  PURCHASE
+  SALE
+  RETURN
+  ADJUSTMENT
+  OPENING
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role
+  shopId       String?
+  shop         Shop?    @relation(fields: [shopId], references: [id])
+  sales        Sale[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([email])
+  @@index([shopId])
+}
+
+model Shop {
+  id          String         @id @default(cuid())
+  name        String
+  address     String
+  phone       String
+  isActive    Boolean        @default(true)
+  users       User[]
+  stockLedger StockLedger[]
+  sales       Sale[]
+  customers   Customer[]
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+}
+
+model Category {
+  id       String    @id @default(cuid())
+  name     String    @unique
+  products Product[]
+}
+
+model Product {
+  id           String        @id @default(cuid())
+  name         String
+  sku          String        @unique
+  description  String?
+  unit         String        @default("pcs")
+  categoryId   String
+  category     Category      @relation(fields: [categoryId], references: [id])
+  pricePaise   Int           // selling price in paise
+  costPaise    Int           // purchase cost in paise
+  stockLedger  StockLedger[]
+  saleItems    SaleItem[]
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([sku])
+  @@index([categoryId])
+}
+
+model StockLedger {
+  id              String          @id @default(cuid())
+  shopId          String
+  shop            Shop            @relation(fields: [shopId], references: [id])
+  productId       String
+  product         Product         @relation(fields: [productId], references: [id])
+  quantityOnHand  Int             @default(0)
+  reorderLevel    Int             @default(5)
+  movements       StockMovement[]
+  updatedAt       DateTime        @updatedAt
+
+  @@unique([shopId, productId])
+  @@index([shopId])
+  @@index([productId])
+}
+
+model StockMovement {
+  id            String            @id @default(cuid())
+  stockLedgerId String
+  stockLedger   StockLedger       @relation(fields: [stockLedgerId], references: [id])
+  type          StockMovementType
+  quantityDelta Int
+  reference     String?
+  note          String?
+  createdAt     DateTime          @default(now())
+
+  @@index([stockLedgerId])
+}
+
+model Customer {
+  id            String   @id @default(cuid())
+  name          String
+  phone         String
+  address       String?
+  shopId        String
+  shop          Shop     @relation(fields: [shopId], references: [id])
+  creditLimitPaise Int  @default(0)
+  sales         Sale[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([shopId])
+  @@index([phone])
+}
+
+model Sale {
+  id               String      @id @default(cuid())
+  invoiceNumber    String      @unique
+  shopId           String
+  shop             Shop        @relation(fields: [shopId], references: [id])
+  customerId       String?
+  customer         Customer?   @relation(fields: [customerId], references: [id])
+  createdById      String
+  createdBy        User        @relation(fields: [createdById], references: [id])
+  status           SaleStatus  @default(DRAFT)
+  items            SaleItem[]
+  payments         SalePayment[]
+  subtotalPaise    Int         @default(0)
+  discountPaise    Int         @default(0)
+  totalPaise       Int         @default(0)
+  paidPaise        Int         @default(0)
+  creditPaise      Int         @default(0)
+  notes            String?
+  confirmedAt      DateTime?
+  voidedAt         DateTime?
+  voidReason       String?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  @@index([shopId])
+  @@index([customerId])
+  @@index([status])
+  @@index([invoiceNumber])
+}
+
+model SaleItem {
+  id            String   @id @default(cuid())
+  saleId        String
+  sale          Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId     String
+  product       Product  @relation(fields: [productId], references: [id])
+  quantity      Int
+  unitPricePaise Int
+  discountPaise Int      @default(0)
+  lineTotalPaise Int
+  createdAt     DateTime @default(now())
+
+  @@index([saleId])
+  @@index([productId])
+}
+
+model SalePayment {
+  id          String      @id @default(cuid())
+  saleId      String
+  sale        Sale        @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  mode        PaymentMode
+  amountPaise Int
+  reference   String?
+  createdAt   DateTime    @default(now())
+
+  @@index([saleId])
+}
+
+model IdempotencyKey {
+  id        String   @id
+  response  Json
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
+  @@index([expiresAt])
+}
+
+model DailyReport {
+  id               String   @id @default(cuid())
+  shopId           String
+  date             DateTime @db.Date
+  totalSalesPaise  Int      @default(0)
+  totalPaidPaise   Int      @default(0)
+  totalCreditPaise Int      @default(0)
+  saleCount        Int      @default(0)
+  createdAt        DateTime @default(now())
+
+  @@unique([shopId, date])
+}
